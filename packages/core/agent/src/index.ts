@@ -252,20 +252,85 @@ interface FactorySlot {
  * remain explicit, as does identity at worker, process, persistence, and wire
  * boundaries. Returned Promise boundaries drain during teardown, except a
  * nested lineage that starts an owning-fiber unload is excluded from its own drain.
+ *
+ * ============================================================================
+ * 【学习笔记：AgentRegistry 的核心职责与架构机制】
+ *
+ * 1. 这个类主要做什么？（定位与核心职责）
+ *    - 它是 Cordis 框架下的全局核心服务之一，通过 `super(ctx, 'agents')` 挂载在根上下文，
+ *      在整个进程中可以通过 `ctx.agents` 直接访问。
+ *    - 职责一【注册表与存活实例目录】：
+ *      维护进程内所有“活着的” Agent 实例（`store` 字典），追踪父子隶属树（`owner`，
+ *      明确谁是主 Agent、谁是子 Agent/Subagent），并提供生命周期事件广播（`agent/created`、`agent/disposed`）。
+ *    - 职责二【解耦 Agent 构建循环】：
+ *      `AgentRegistry` 自身不实现大模型多轮对话、工具调用的轮次循环（Loop），具体实例化
+ *      通过插槽委托给外部工厂（`factory: AgentFactory`，由 `@deepseek-ai/dsh-agent-loop` 注入）。
+ *      这种设计解耦了“注册/查询/类型投射”与“运行循环驱动”，打破了循环依赖。
+ *    - 职责三【因果归因与隐式上下文传递（initiators）】：
+ *      基于 Node.js 原生 `AsyncLocalStorage`，在同一个进程内，跨越深层异步调用链（Promise / async-await），
+ *      隐式传播“当前这一系列操作是由哪一个 Agent 发起的”，免去在所有底层函数参数中层层透传 `agent` 的污染。
+ *    - 职责四【优雅排空停机与防死锁（Teardown Drain）】：
+ *      当包含当前服务的插件或 Fiber 卸载时，自动拒绝新任务并等待所有进行中的异步操作优雅结算（Drain），
+ *      且内置了“自卸载防死锁”机制（防止当前任务触发卸载时无限等待自己完成）。
+ *
+ * 2. 为什么需要 `initiators`（AsyncLocalStorage）？
+ *    - 解决痛点：系统中有大量底层组件（如文件系统、Shell 执行器、Web 请求、日志系统、指标监控等）。
+ *      当一个 Agent 触发某个底层操作时，这些底层组件需要记录“这是谁干的”（Causal Attribution）。
+ *      如果通过函数入参层层显式传递 `agent`，整个代码库的函数签名都会被严重污染。
+ *    - 运行原理：通过 `withInitiator(agent, () => ...)` 开启一个异步作用域。在这个函数及其调用的
+ *      任何深层异步代码中，直接调用 `ctx.agents.currentInitiator()` 即可拿到发起者 Agent。
+ *    - 安全界限：仅用于“同进程内的因果关联与可观测性（日志/追踪）”，严禁作为跨进程、跨工作区或安全鉴权的凭据。
+ * ============================================================================
  */
 export class AgentRegistry extends Service {
+  /**
+   * 进程内所有存活 Agent 的权威目录字典（SessionId -> AgentEntry）。
+   * 记录了实例引用、所属父级（owner）、生命周期状态机标记（两阶段发布 announce / detach 等）。
+   */
   private store = new Map<SessionId, AgentEntry>()
+
+  /**
+   * Agent 创建工厂插槽（延迟注入）。
+   * 实际的 Agent 构建与运行由 `@deepseek-ai/dsh-agent-loop` 提供并通过 `setFactory()` 注入。
+   * 用 FactorySlot 对象包裹是为了防止 Cordis 框架在调用者上下文明确前过早对 Service 属性建立追踪代理。
+   */
   private factory: FactorySlot | undefined
+
+  /**
+   * 【核心成员：异步发起者追踪器】
+   * 基于 Node.js 原生 AsyncLocalStorage。
+   * 在当前同进程的异步调用栈上下文中，维护当前链路的发起者 Agent（即 Causal Initiator）。
+   * 使得在任意深度的异步回调、工具调用或日志追踪中，无需层层显式传递 agent 参数即可追溯来源。
+   */
   private readonly initiators = new AsyncLocalStorage<Agent | undefined>()
+
+  /**
+   * 【发起者调用链路链表】
+   * 通过 AsyncLocalStorage 记录当前异步任务的嵌套链（`run.parent`），
+   * 用于在优雅停机（Drain）时追踪在途任务，并在自卸载（Reentrant unload）时排除自身防止死锁。
+   */
   private readonly initiatorRuns = new AsyncLocalStorage<InitiatorRun>()
+
+  /** 发起者服务的生命周期状态：'active'（正常处理） | 'closing'（停止接收新边界，等待排空） | 'disposed'（已完全注销） */
   private initiatorState: 'active' | 'closing' | 'disposed' = 'active'
+
+  /** 当前在途进行中的 initiator 异步任务计数（计数归 0 时触发 initiatorDrain resolve） */
   private activeInitiatorRuns = 0
+
+  /** 优雅停机排空器：当服务准备注销且仍有在途异步任务时创建，待所有任务完成后 resolve */
   private initiatorDrain: PromiseWithResolvers<void> | undefined
+
+  /** 服务停机过程的单例 Promise，确保注销逻辑只执行一次 */
   private initiatorDisposal: Promise<void> | undefined
 
   constructor(ctx: Context) {
+    // 1. 将自身注册为 Cordis 服务，挂载到全局上下文上的名称为 'agents'（即通过 ctx.agents 访问）
     super(ctx, 'agents')
+
+    // 2. 注入并集成 Typert RPC 类型运行时协议网关：
+    // 当存在 typert 服务时，注册 Agent 与 SessionId 之间的 Host <-> Wire 自动编解码与查找映射
     ctx.inject(['typert'], (typeCtx) => {
+      // 注册远程参数解析器：将 RPC 传输的 wire 参数 "agentId" (SessionId) 自动转换为内存中的宿主 Agent 实例
       typeCtx.typert.lookups.register('agent', {
         parameter: 'agent',
         wire: 'agentId',
@@ -273,24 +338,33 @@ export class AgentRegistry extends Service {
         wireTypeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
         resolve: sessionId => this.get(sessionId),
       })
+      // 注册宿主上下文解析器：根据 agentId 解析出该 Agent 绑定的专属 Cordis Context（agent.ctx）
       typeCtx.typert.contexts.registerHost('agent', {
         wire: 'agentId',
         wireTypeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
         resolve: sessionId => this.get(sessionId)?.ctx,
       })
     })
-    // The `ctx.agent` DX accessor: default `undefined` on every context, so a
-    // plain plugin context reads cleanly instead of hitting the Cordis
-    // unknown-property throw. Each Agent.ctx shadows it with an own property
-    // (own properties resolve before the context proxy is consulted), so the
-    // accessor body never needs to resolve a scope itself. Effect-scoped:
-    // unwinds with this service's fiber.
+
+    // 3. 定义全局通用的 `ctx.agent` 便捷访问器（DX 体验优化）：
+    // 在 Cordis 中，访问 Context 上未声明的属性会直接抛错。
+    // 这里在顶层上下文默认注册一个 getter 返回 undefined，保证普通插件上下文读取 `ctx.agent` 安全返回 undefined。
+    // 而真正运行中的 Agent 会在自身的 `agent.ctx` 上以自身属性（Own Property）形式遮蔽（Shadow）此属性并返回其实例。
     ctx.accessor('agent', { get: () => undefined })
+
+    // 4. 监听 Cordis 内部 Fiber 状态变更，提前进入停机准备：
+    // 若当前服务的祖先生命周期 Fiber 开始卸载（UNLOADING），立即调用 closeInitiators() 拒绝新的 initiator 边界，
+    // 在子级资源被完全拆除前尽早阻止新操作进入。
     ctx.on('internal/status', (fiber) => {
       if (fiber.state === FiberState.UNLOADING && this.hasLifecycleAncestor(fiber)) {
         this.closeInitiators()
       }
     })
+
+    // 5. 声明本服务的生命周期清理 Effect（采用 Generator 逆序执行清理）：
+    // Cordis 生成器 effect 的清理函数按照 yield 的逆序执行：
+    // - 卸载时先执行第 2 个 yield：调用 this.closeInitiators()（拒收新任务）
+    // - 接着执行第 1 个 yield：调用 this.disposeInitiators()（等待排空已存在的任务，并彻底注销 ALS）
     ctx.effect(function* (this: AgentRegistry) {
       yield () => this.disposeInitiators()
       yield () => { this.closeInitiators() }
@@ -616,12 +690,22 @@ export class AgentRegistry extends Service {
       .map(entry => entry.agent)
   }
 
-  /** Reject new initiator boundaries while inherited continuations drain. */
+  /**
+   * Reject new initiator boundaries while inherited continuations drain.
+   * 停止接收新的 withInitiator 边界，准备进行优雅排空。
+   */
   private closeInitiators(): void {
     if (this.initiatorState === 'active') this.initiatorState = 'closing'
   }
 
-  /** Wait for returned-Promise boundaries, then invalidate retained references. */
+  /**
+   * Wait for returned-Promise boundaries, then invalidate retained references.
+   * 优雅停机注销：
+   * 1. 阻止新任务（closeInitiators）
+   * 2. 剔除因自卸载而重入的链路，防止自等待死锁（releaseReentrantInitiatorRuns）
+   * 3. 等待所有在途异步操作排空完毕（await initiatorDrain.promise）
+   * 4. 彻底禁用 AsyncLocalStorage，释放引用避免内存泄露
+   */
   private disposeInitiators(): Promise<void> {
     return (this.initiatorDisposal ??= (async () => {
       this.closeInitiators()
@@ -636,7 +720,12 @@ export class AgentRegistry extends Service {
     })())
   }
 
-  /** Establish one tracked initiator or clearing boundary. */
+  /**
+   * Establish one tracked initiator or clearing boundary.
+   * 在 AsyncLocalStorage 中绑定指定 agent（或 undefined 清除发起者），
+   * 同时记录 InitiatorRun 链表并增加在途计数（activeInitiatorRuns）。
+   * 若 operation 返回 Promise，会在其 settled 时自动扣减计数以支持优雅排空。
+   */
   private runWithInitiator<T>(agent: Agent | undefined, operation: () => T): T {
     if (this.initiatorState !== 'active') throw new Error(DISPOSED_INITIATOR_MESSAGE)
     const run: InitiatorRun = {
