@@ -36,6 +36,7 @@ export { KNOWN_SESSION_EVENT_TYPES } from './known-event-types.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
+    /** 会话存储服务服务注入点：挂载 SessionStore 实例，通过 ctx.sessions 访问 */
     sessions: SessionStore
   }
 
@@ -574,6 +575,12 @@ export class Session {
    * contained per listener, so they do not change the return value or prevent
    * later listeners from observing the same accepted event.
    *
+   * 【追加日志事件的核心方法 (Append-only Log)】
+   * 1. 强校验与快照：校验 data 和 surface 选项必须严格满足无损 JSON 序列化，并对其执行深冻结 (deepFreeze)。
+   * 2. Surface 管理：更新维护 surfaceOp（如追加、替换压缩节点），作为 LLM 真实历史推导的消息基准。
+   * 3. 提交与并发防重入：将事件 push 到私有 log 数组（分配不可变的递增 seq 与时间戳），随后触发广播。
+   * 4. 监听者容错隔离：同步通知 session/event 监听者（例如持久化插件、UI/网络投递通道），单个监听者崩溃不会打断提交。
+   *
    * @param type - The event type (key of {@link SessionEventMap}).
    * @param data - The event payload; must be JSON-serializable.
    * @param opts - Surface metadata: `surfaceOp` controls how the event enters
@@ -788,6 +795,14 @@ export class SessionForkError extends Error {
  *
  * Persistence is intentionally not implemented here — persistence plugins
  * subscribe to `session/event` and flush on `session/flush` / dispose.
+ *
+ * 【内存会话注册表服务 (SessionStore)】
+ * 负责管理当前进程内所有活性的 Session。
+ * 核心设计：
+ * 1. 纯内存与事件驱动：Session 本身不直接做持久化，持久化通过监听 Cordis 事件系统完成
+ *    (如 `session/event` 实时写入缓冲区, `session/flush` 或销毁时刷盘)。
+ * 2. 两阶段发布事务：拆分为 prepare (构造/校验) -> enter (注册进表并获取销毁器 detach) -> announce (广播 session/created)。
+ *    当生命周期发生异常或回滚时，能够严格有序地清理，避免幽灵会话泄漏。
  */
 export class SessionStore extends Service {
   private store = new Map<SessionId, SessionEntry>()
