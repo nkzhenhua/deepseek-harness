@@ -8,15 +8,36 @@
  * @module @deepseek-ai/dsh-session/surface
  */
 
-import type { Message } from '@deepseek-ai/dsh-llm'
-import type { SessionEvent, SurfaceEvent, SurfaceEventType, SurfaceOp } from './types.ts'
+import type { Message } from "@deepseek-ai/dsh-llm";
+import type {
+  SessionEvent,
+  SurfaceEvent,
+  SurfaceEventType,
+  SurfaceOp,
+} from "./types.ts";
 
+/**
+ * 1. surface.ts —— 理解上下文视图、历史折叠与裁剪
+为什么值得看：
+我们在前面讨论的 nodes（表面节点）、增量消息派生 deriveMessages()，
+以及历史压缩和替换（Replacement），其底层算法和数据结构全部实现在这个文件里。
+
+核心内容：
+
+SurfaceManager 类：管理当前可见的节点索引序列。
+
+foldSurface()：处理 surfaceOp（如 append 或 replacement）的核心折叠逻辑，
+告诉你新事件是如何切掉旧消息并挂载到树上的。
+
+deriveEventMessage()：如何把底层的各种事件（如 user/message、assistant/message）
+精准转换成 LLM 能听懂的标准消息。
+*/
 /** Runtime counterpart of the message-producing event union. */
 const SURFACE_EVENT_TYPES = new Set<string>([
-  'user/message',
-  'assistant/message',
-  'tool/result',
-])
+  "user/message",
+  "assistant/message",
+  "tool/result",
+]);
 
 /**
  * Whether an event type can join the model-visible surface.
@@ -24,7 +45,7 @@ const SURFACE_EVENT_TYPES = new Set<string>([
  * @returns true for one of the three message-producing event types.
  */
 export function isSurfaceEligibleType(type: string): boolean {
-  return SURFACE_EVENT_TYPES.has(type)
+  return SURFACE_EVENT_TYPES.has(type);
 }
 
 /**
@@ -33,8 +54,8 @@ export function isSurfaceEligibleType(type: string): boolean {
  * @returns true when both the type and marker identify a surface event.
  */
 export function isSurfaceEvent(event: SessionEvent): event is SurfaceEvent {
-  if (!SURFACE_EVENT_TYPES.has(event.type)) return false
-  return (event as SessionEvent<SurfaceEventType>).surfaceOp !== undefined
+  if (!SURFACE_EVENT_TYPES.has(event.type)) return false;
+  return (event as SessionEvent<SurfaceEventType>).surfaceOp !== undefined;
 }
 
 /**
@@ -50,8 +71,8 @@ export function isSurfaceEvent(event: SessionEvent): event is SurfaceEvent {
  */
 export function isAppendSurfaceEvent(
   event: SessionEvent,
-): event is SurfaceEvent & { surfaceOp: 'append' } {
-  return isSurfaceEvent(event) && event.surfaceOp === 'append'
+): event is SurfaceEvent & { surfaceOp: "append" } {
+  return isSurfaceEvent(event) && event.surfaceOp === "append";
 }
 
 /**
@@ -63,8 +84,10 @@ export function isAppendSurfaceEvent(
  */
 export function isReplacementSurfaceEvent(
   event: SessionEvent,
-): event is SurfaceEvent & { surfaceOp: Extract<SurfaceOp, { op: 'replace' }> } {
-  return isSurfaceEvent(event) && event.surfaceOp !== 'append'
+): event is SurfaceEvent & {
+  surfaceOp: Extract<SurfaceOp, { op: "replace" }>;
+} {
+  return isSurfaceEvent(event) && event.surfaceOp !== "append";
 }
 
 /**
@@ -93,118 +116,133 @@ export function deriveEventMessage(event: SessionEvent): Message | null {
     // renderer, keeping this projection a verbatim pass-through. See the
     // deferred design note in
     // ../../../../.agents/notes/implemented/simplification/2026-07-20-unwrap-injected-content-envelopes.md
-    case 'user/message': {
-      return event.data
+    case "user/message": {
+      return event.data;
     }
-    case 'assistant/message': {
+    case "assistant/message": {
       // Skip an empty-content assistant/message: it exists only to host a
       // max-tokens step's usage and must not inject a content-less assistant
       // turn into the provider transcript.
-      if (event.data.message.content.length === 0) return null
-      return event.data.message
+      if (event.data.message.content.length === 0) return null;
+      return event.data.message;
     }
-    case 'tool/result': {
-      return event.data.message
+    case "tool/result": {
+      return event.data.message;
     }
     default:
       // A non-surface event (boundary, chunk, log-only record) projects to
       // no message. Merge-extensible union: no assertNever here.
-      return null
+      return null;
   }
 }
 
 /** One replacement operation observed while folding a session surface. */
 export interface SurfaceFoldReplacement {
   /** Seq of the event that replaced the prior surface range. */
-  seq: number
+  seq: number;
   /** Declared inclusive start seq of the replaced surface range. */
-  start: number
+  start: number;
   /** Declared inclusive end seq of the replaced surface range. */
-  end: number
+  end: number;
   /** Actual surface entries removed by the operation, in surface order. */
-  shadowedSeqs: number[]
+  shadowedSeqs: number[];
 }
 
 /** Complete result of replaying the surface operations in a session log. */
 export interface SurfaceFoldResult {
   /** Current surface event sequences in model-visible order. */
-  nodes: number[]
+  nodes: number[];
   /** Replacement operations in event order. */
-  replacements: SurfaceFoldReplacement[]
+  replacements: SurfaceFoldReplacement[];
 }
 
 /** Readonly live projection of the message-producing session events. */
 export interface SessionSurface {
   /** Current surface event sequences in model-visible order. */
-  readonly nodes: readonly number[]
+  readonly nodes: readonly number[];
   /** Monotonic count of committed positional replacements. */
-  readonly replaceGeneration: number
+  readonly replaceGeneration: number;
 }
 
 /** Mutable state shared by complete and incremental folds. */
 interface SurfaceFoldState {
-  nodes: number[]
-  replaceGeneration: number
+  nodes: number[];
+  replaceGeneration: number;
 }
 
 /** A validated replacement transition that has not mutated fold state yet. */
 interface SurfaceReplacePlan extends SurfaceFoldReplacement {
-  kind: 'replace'
-  startIdx: number
-  endIdx: number
+  kind: "replace";
+  startIdx: number;
+  endIdx: number;
 }
 
 /** One validated surface transition that has not mutated fold state yet. */
-type SurfacePlan =
-  | { kind: 'append'; seq: number }
-  | SurfaceReplacePlan
+type SurfacePlan = { kind: "append"; seq: number } | SurfaceReplacePlan;
 
 /** Create an empty surface fold state. */
 function createFoldState(): SurfaceFoldState {
-  return { nodes: [], replaceGeneration: 0 }
+  return { nodes: [], replaceGeneration: 0 };
 }
 
 /** Whether a runtime value is a non-negative safe event sequence. */
 function isEventSeq(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** Whether a runtime value is the exact positional-replacement shape. */
-function isReplaceOp(value: object): value is Extract<SurfaceOp, { op: 'replace' }> {
-  const op = value as Record<string, unknown>
-  return Object.keys(op).length === 3
-    && Object.hasOwn(op, 'op')
-    && Object.hasOwn(op, 'start')
-    && Object.hasOwn(op, 'end')
-    && op['op'] === 'replace'
-    && isEventSeq(op['start'])
-    && isEventSeq(op['end'])
+function isReplaceOp(
+  value: object,
+): value is Extract<SurfaceOp, { op: "replace" }> {
+  const op = value as Record<string, unknown>;
+  return (
+    Object.keys(op).length === 3 &&
+    Object.hasOwn(op, "op") &&
+    Object.hasOwn(op, "start") &&
+    Object.hasOwn(op, "end") &&
+    op["op"] === "replace" &&
+    isEventSeq(op["start"]) &&
+    isEventSeq(op["end"])
+  );
 }
 
 /** Validate event-local surface eligibility and return its operation. */
 function surfaceOpOf(event: SessionEvent): SurfaceOp | undefined {
-  const raw = event as SessionEvent & { surfaceOp?: unknown; sourceEventSeqs?: unknown }
+  const raw = event as SessionEvent & {
+    surfaceOp?: unknown;
+    sourceEventSeqs?: unknown;
+  };
   if (!isSurfaceEligibleType(event.type)) {
     if (raw.surfaceOp !== undefined) {
-      throw new Error(`session event "${event.type}" is not surface-eligible and cannot carry surfaceOp`)
+      throw new Error(
+        `session event "${event.type}" is not surface-eligible and cannot carry surfaceOp`,
+      );
     }
     if (raw.sourceEventSeqs !== undefined) {
-      throw new Error(`session event "${event.type}" is not surface-eligible and cannot carry sourceEventSeqs`)
+      throw new Error(
+        `session event "${event.type}" is not surface-eligible and cannot carry sourceEventSeqs`,
+      );
     }
-    return
+    return;
   }
-  const op = raw.surfaceOp
+  const op = raw.surfaceOp;
   if (op === undefined) {
-    throw new Error(`session event "${event.type}" is surface-eligible and requires a surfaceOp marker`)
+    throw new Error(
+      `session event "${event.type}" is surface-eligible and requires a surfaceOp marker`,
+    );
   }
-  if (op === 'append') return op
-  if (op === null || typeof op !== 'object' || Array.isArray(op)) {
-    throw new Error(`session event "${event.type}" carries an invalid surfaceOp`)
+  if (op === "append") return op;
+  if (op === null || typeof op !== "object" || Array.isArray(op)) {
+    throw new Error(
+      `session event "${event.type}" carries an invalid surfaceOp`,
+    );
   }
   if (!isReplaceOp(op)) {
-    throw new Error(`session event "${event.type}" carries an invalid replace surfaceOp`)
+    throw new Error(
+      `session event "${event.type}" carries an invalid replace surfaceOp`,
+    );
   }
-  return op
+  return op;
 }
 
 /** Validate cited source-event seqs against prior log entries and the replacement range. */
@@ -212,57 +250,73 @@ function assertProvenance(
   event: SessionEvent,
   shadowedSeqs: readonly number[],
 ): void {
-  const raw = (event as SessionEvent & { sourceEventSeqs?: unknown }).sourceEventSeqs
-  const sources = new Set<number>()
+  const raw = (event as SessionEvent & { sourceEventSeqs?: unknown })
+    .sourceEventSeqs;
+  const sources = new Set<number>();
   if (raw !== undefined) {
     if (!Array.isArray(raw)) {
-      throw new Error(`sourceEventSeqs on event at seq ${event.seq} must be an array when present`)
+      throw new Error(
+        `sourceEventSeqs on event at seq ${event.seq} must be an array when present`,
+      );
     }
-    if (raw.length === 0 && event.type !== 'assistant/message') {
-      throw new Error('sourceEventSeqs must not be empty except on assistant/message')
+    if (raw.length === 0 && event.type !== "assistant/message") {
+      throw new Error(
+        "sourceEventSeqs must not be empty except on assistant/message",
+      );
     }
-    let nonEarlierSource: number | undefined
+    let nonEarlierSource: number | undefined;
     for (const source of raw) {
       if (!isEventSeq(source)) {
-        throw new Error(`session event "${event.type}" sourceEventSeqs must densely contain non-negative safe integers`)
+        throw new Error(
+          `session event "${event.type}" sourceEventSeqs must densely contain non-negative safe integers`,
+        );
       }
-      sources.add(source)
-      if (nonEarlierSource === undefined && source >= event.seq) nonEarlierSource = source
+      sources.add(source);
+      if (nonEarlierSource === undefined && source >= event.seq)
+        nonEarlierSource = source;
     }
     if (sources.size !== raw.length) {
-      throw new Error('sourceEventSeqs must not contain duplicates')
+      throw new Error("sourceEventSeqs must not contain duplicates");
     }
     if (nonEarlierSource !== undefined) {
-      throw new Error(`sourceEventSeqs must reference earlier events: ${nonEarlierSource} >= current seq ${event.seq}`)
+      throw new Error(
+        `sourceEventSeqs must reference earlier events: ${nonEarlierSource} >= current seq ${event.seq}`,
+      );
     }
   }
-  const missing = shadowedSeqs.filter(seq => !sources.has(seq))
+  const missing = shadowedSeqs.filter((seq) => !sources.has(seq));
   if (missing.length > 0) {
-    throw new Error(`surface replace: sourceEventSeqs must include every shadowed surface node; missing ${missing.join(', ')}`)
+    throw new Error(
+      `surface replace: sourceEventSeqs must include every shadowed surface node; missing ${missing.join(", ")}`,
+    );
   }
 }
 
 /** Locate one replacement range without mutating the current fold state. */
 function replacementRange(
   state: SurfaceFoldState,
-  op: Extract<SurfaceOp, { op: 'replace' }>,
-): Pick<SurfaceReplacePlan, 'startIdx' | 'endIdx' | 'shadowedSeqs'> {
-  const startIdx = state.nodes.indexOf(op.start)
+  op: Extract<SurfaceOp, { op: "replace" }>,
+): Pick<SurfaceReplacePlan, "startIdx" | "endIdx" | "shadowedSeqs"> {
+  const startIdx = state.nodes.indexOf(op.start);
   if (startIdx === -1) {
-    throw new Error(`surface replace: start seq ${op.start} not found in surface`)
+    throw new Error(
+      `surface replace: start seq ${op.start} not found in surface`,
+    );
   }
-  const endIdx = state.nodes.indexOf(op.end)
+  const endIdx = state.nodes.indexOf(op.end);
   if (endIdx === -1) {
-    throw new Error(`surface replace: end seq ${op.end} not found in surface`)
+    throw new Error(`surface replace: end seq ${op.end} not found in surface`);
   }
   if (startIdx > endIdx) {
-    throw new Error(`surface replace: start seq ${op.start} (index ${startIdx}) is after end seq ${op.end} (index ${endIdx})`)
+    throw new Error(
+      `surface replace: start seq ${op.start} (index ${startIdx}) is after end seq ${op.end} (index ${endIdx})`,
+    );
   }
   return {
     startIdx,
     endIdx,
     shadowedSeqs: state.nodes.slice(startIdx, endIdx + 1),
-  }
+  };
 }
 
 /**
@@ -271,16 +325,27 @@ function replacementRange(
  * `node:util`'s isDeepStrictEqual to keep this module browser-safe.
  */
 function isDeepEqualJson(a: unknown, b: unknown): boolean {
-  if (a === b) return true
+  if (a === b) return true;
   if (Array.isArray(a) || Array.isArray(b)) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
-    return a.every((item, i) => isDeepEqualJson(item, b[i]))
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length)
+      return false;
+    return a.every((item, i) => isDeepEqualJson(item, b[i]));
   }
-  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
-  const aKeys = Object.keys(a)
-  const bRecord = b as Record<string, unknown>
-  if (aKeys.length !== Object.keys(b).length) return false
-  return aKeys.every(key => Object.hasOwn(b, key) && isDeepEqualJson((a as Record<string, unknown>)[key], bRecord[key]))
+  if (
+    typeof a !== "object" ||
+    typeof b !== "object" ||
+    a === null ||
+    b === null
+  )
+    return false;
+  const aKeys = Object.keys(a);
+  const bRecord = b as Record<string, unknown>;
+  if (aKeys.length !== Object.keys(b).length) return false;
+  return aKeys.every(
+    (key) =>
+      Object.hasOwn(b, key) &&
+      isDeepEqualJson((a as Record<string, unknown>)[key], bRecord[key]),
+  );
 }
 
 /** Restrict a tool-result replacement to one current result's content. */
@@ -290,29 +355,35 @@ function assertToolResultRewrite(
   events: readonly SessionEvent[],
   baseSeq: number,
 ): void {
-  if (event.type !== 'tool/result') return
+  if (event.type !== "tool/result") return;
   if (shadowedSeqs.length !== 1) {
-    throw new Error('tool/result surface replacement must rewrite exactly one current node')
+    throw new Error(
+      "tool/result surface replacement must rewrite exactly one current node",
+    );
   }
   for (const originalSeq of shadowedSeqs) {
-    const original = events[originalSeq - baseSeq]
-    if (original?.type !== 'tool/result') {
-      throw new Error('tool/result surface replacement must target a current tool/result')
+    const original = events[originalSeq - baseSeq];
+    if (original?.type !== "tool/result") {
+      throw new Error(
+        "tool/result surface replacement must target a current tool/result",
+      );
     }
-    const originalRest = { ...original.data } as Record<string, unknown>
-    const replacementRest = { ...event.data } as Record<string, unknown>
-    const originalResult = original.data.message.content[0]
-    const replacementResult = event.data.message.content[0]
-    originalRest['message'] = {
+    const originalRest = { ...original.data } as Record<string, unknown>;
+    const replacementRest = { ...event.data } as Record<string, unknown>;
+    const originalResult = original.data.message.content[0];
+    const replacementResult = event.data.message.content[0];
+    originalRest["message"] = {
       ...original.data.message,
       content: [{ ...originalResult, content: null }],
-    }
-    replacementRest['message'] = {
+    };
+    replacementRest["message"] = {
       ...event.data.message,
       content: [{ ...replacementResult, content: null }],
-    }
+    };
     if (!isDeepEqualJson(originalRest, replacementRest)) {
-      throw new Error('tool/result surface replacement may change only content')
+      throw new Error(
+        "tool/result surface replacement may change only content",
+      );
     }
   }
 }
@@ -326,24 +397,26 @@ function planSurfaceEvent(
   baseSeq: number,
 ): SurfacePlan | undefined {
   if (event.seq !== expectedSeq) {
-    throw new Error(`session event seq ${event.seq} is not contiguous; expected ${expectedSeq}`)
+    throw new Error(
+      `session event seq ${event.seq} is not contiguous; expected ${expectedSeq}`,
+    );
   }
-  const surfaceOp = surfaceOpOf(event)
-  if (surfaceOp === undefined) return
-  if (surfaceOp === 'append') {
-    assertProvenance(event, [])
-    return { kind: 'append', seq: event.seq }
+  const surfaceOp = surfaceOpOf(event);
+  if (surfaceOp === undefined) return;
+  if (surfaceOp === "append") {
+    assertProvenance(event, []);
+    return { kind: "append", seq: event.seq };
   }
-  const range = replacementRange(state, surfaceOp)
-  assertProvenance(event, range.shadowedSeqs)
-  assertToolResultRewrite(event, range.shadowedSeqs, events, baseSeq)
+  const range = replacementRange(state, surfaceOp);
+  assertProvenance(event, range.shadowedSeqs);
+  assertToolResultRewrite(event, range.shadowedSeqs, events, baseSeq);
   return {
-    kind: 'replace',
+    kind: "replace",
     seq: event.seq,
     start: surfaceOp.start,
     end: surfaceOp.end,
     ...range,
-  }
+  };
 }
 
 /** Apply one event and return replacement metadata only when one occurred. */
@@ -354,8 +427,8 @@ function applySurfaceEvent(
   events: readonly SessionEvent[],
   baseSeq: number,
 ): SurfaceFoldReplacement | undefined {
-  const plan = planSurfaceEvent(state, event, expectedSeq, events, baseSeq)
-  return applySurfacePlan(state, plan)
+  const plan = planSurfaceEvent(state, event, expectedSeq, events, baseSeq);
+  return applySurfacePlan(state, plan);
 }
 
 /** Commit one previously validated surface transition. */
@@ -363,19 +436,23 @@ function applySurfacePlan(
   state: SurfaceFoldState,
   plan: SurfacePlan | undefined,
 ): SurfaceFoldReplacement | undefined {
-  if (plan?.kind === 'append') {
-    state.nodes.push(plan.seq)
-  } else if (plan?.kind === 'replace') {
-    state.nodes.splice(plan.startIdx, plan.endIdx - plan.startIdx + 1, plan.seq)
-    state.replaceGeneration += 1
+  if (plan?.kind === "append") {
+    state.nodes.push(plan.seq);
+  } else if (plan?.kind === "replace") {
+    state.nodes.splice(
+      plan.startIdx,
+      plan.endIdx - plan.startIdx + 1,
+      plan.seq,
+    );
+    state.replaceGeneration += 1;
   }
-  if (plan?.kind !== 'replace') return
+  if (plan?.kind !== "replace") return;
   return {
     seq: plan.seq,
     start: plan.start,
     end: plan.end,
     shadowedSeqs: plan.shadowedSeqs,
-  }
+  };
 }
 
 /**
@@ -384,24 +461,32 @@ function applySurfacePlan(
  * @returns detached current sequences and replacement history.
  * @throws when an event violates surface metadata, source-event references, range, or tool-result rewrite rules.
  */
-export function foldSurface(events: readonly SessionEvent[]): SurfaceFoldResult {
-  const state = createFoldState()
-  const replacements: SurfaceFoldReplacement[] = []
+export function foldSurface(
+  events: readonly SessionEvent[],
+): SurfaceFoldResult {
+  const state = createFoldState();
+  const replacements: SurfaceFoldReplacement[] = [];
   for (const [index, event] of events.entries()) {
-    const replacement = applySurfaceEvent(state, event, index, events, 0)
-    if (replacement !== undefined) replacements.push(replacement)
+    const replacement = applySurfaceEvent(state, event, index, events, 0);
+    if (replacement !== undefined) replacements.push(replacement);
   }
-  return { nodes: [...state.nodes], replacements }
+  return { nodes: [...state.nodes], replacements };
 }
 
 /** Incremental ordered surface view and append-boundary validator. */
 export class SurfaceManager implements SessionSurface {
   /** Shared transition state; replacement history is not retained. */
-  private _state = createFoldState()
+  private _state = createFoldState();
   /** Last processed absolute seq. */
-  private _lastProcessedSeq: number
+  private _lastProcessedSeq: number;
   /** Candidate already validated by `validateNext`, pending exact log admission. */
-  private _pendingPlan: { event: SessionEvent; expectedSeq: number; plan: SurfacePlan | undefined } | undefined
+  private _pendingPlan:
+    | {
+        event: SessionEvent;
+        expectedSeq: number;
+        plan: SurfacePlan | undefined;
+      }
+    | undefined;
 
   /**
    * @param log - Contiguous complete log or loaded event window.
@@ -411,7 +496,7 @@ export class SurfaceManager implements SessionSurface {
     private log: readonly SessionEvent[],
     private readonly baseSeq = 0,
   ) {
-    this._lastProcessedSeq = baseSeq - 1
+    this._lastProcessedSeq = baseSeq - 1;
   }
 
   /**
@@ -419,42 +504,52 @@ export class SurfaceManager implements SessionSurface {
    * @param event - candidate event that has not entered the log yet.
    */
   validateNext(event: SessionEvent): void {
-    if (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta()
-    const expectedSeq = this.baseSeq + this.log.length
+    if (this._lastProcessedSeq < this.baseSeq + this.log.length - 1)
+      this._processDelta();
+    const expectedSeq = this.baseSeq + this.log.length;
     this._pendingPlan = {
       event,
       expectedSeq,
-      plan: planSurfaceEvent(this._state, event, expectedSeq, this.log, this.baseSeq),
-    }
+      plan: planSurfaceEvent(
+        this._state,
+        event,
+        expectedSeq,
+        this.log,
+        this.baseSeq,
+      ),
+    };
   }
 
   /** Monotonic count of folded positional replacements. */
   get replaceGeneration(): number {
-    if (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta()
-    return this._state.replaceGeneration
+    if (this._lastProcessedSeq < this.baseSeq + this.log.length - 1)
+      this._processDelta();
+    return this._state.replaceGeneration;
   }
 
   /** Surface event sequences in model-visible order. */
   get nodes(): readonly number[] {
-    if (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta()
-    return this._state.nodes
+    if (this._lastProcessedSeq < this.baseSeq + this.log.length - 1)
+      this._processDelta();
+    return this._state.nodes;
   }
 
   /** Fold events appended since the previous access. */
   private _processDelta(): void {
-    const tailSeq = this.baseSeq + this.log.length - 1
+    const tailSeq = this.baseSeq + this.log.length - 1;
     for (let seq = this._lastProcessedSeq + 1; seq <= tailSeq; seq++) {
-      const index = seq - this.baseSeq
+      const index = seq - this.baseSeq;
       // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded by the loop condition
-      const event = this.log[index]!
-      const pending = this._pendingPlan
+      const event = this.log[index]!;
+      const pending = this._pendingPlan;
       if (pending?.event === event && pending.expectedSeq === seq) {
-        applySurfacePlan(this._state, pending.plan)
+        applySurfacePlan(this._state, pending.plan);
       } else {
-        applySurfaceEvent(this._state, event, seq, this.log, this.baseSeq)
+        applySurfaceEvent(this._state, event, seq, this.log, this.baseSeq);
       }
-      if (pending !== undefined && pending.expectedSeq <= seq) this._pendingPlan = undefined
-      this._lastProcessedSeq = seq
+      if (pending !== undefined && pending.expectedSeq <= seq)
+        this._pendingPlan = undefined;
+      this._lastProcessedSeq = seq;
     }
   }
 }
