@@ -17,20 +17,16 @@ import type {
 } from "./types.ts";
 
 /**
- * 1. surface.ts —— 理解上下文视图、历史折叠与裁剪
-为什么值得看：
-我们在前面讨论的 nodes（表面节点）、增量消息派生 deriveMessages()，
-以及历史压缩和替换（Replacement），其底层算法和数据结构全部实现在这个文件里。
+在整个 DeepSeek Harness (dsh-session) 架构中，底层的日志（Event Log）
+是只读且不可变的（Append-only），它记录了所有的原始事件。
+但对于 LLM 来说，它不需要感知那些诸如 Token 块、步骤边界等底层噪音，
+它只需要一个经过裁剪、替换（如历史压缩、上下文重写）后的线性消息序列。
 
-核心内容：
+surface.ts 的核心作用，就是在只读日志之上建立一个视图层（Surface Layer）：
 
-SurfaceManager 类：管理当前可见的节点索引序列。
+输入：包含 surfaceOp 标记的各种 SessionEvent。
 
-foldSurface()：处理 surfaceOp（如 append 或 replacement）的核心折叠逻辑，
-告诉你新事件是如何切掉旧消息并挂载到树上的。
-
-deriveEventMessage()：如何把底层的各种事件（如 user/message、assistant/message）
-精准转换成 LLM 能听懂的标准消息。
+输出：模型可见的有效消息序列（nodes 节点索引序列）。
 */
 /** Runtime counterpart of the message-producing event union. */
 const SURFACE_EVENT_TYPES = new Set<string>([
@@ -102,6 +98,20 @@ export function isReplacementSurfaceEvent(
  * model requests.
  * @param event - the event to project.
  * @returns the derived message, or null when the event produces none.
+ */
+/**
+ *
+ * 背景：在 dsh-session 中，底层日志（Event Log）是不可变的、追加写入的（Append-only），
+ * 里面充满了诸如 token 块（chunk）、轮次/步骤边界（boundary）、纯日志记录（log-only record）
+ * 等大量调试或统计信息。
+ * 职责：LLM 模型不需要这些噪音。deriveEventMessage 充当了一个纯函数式的过滤器和投影器，
+ * 只把真正构筑对话历史的有效事件挑选出来，并把它们降维/投影成模型能懂的标准 Message 格式。
+ *
+ * 以下两类事件会投影为 null（即被视窗丢弃，不发给模型）：
+ * 非 Surface 事件：如 chunk、boundary、log-only，它们纯粹是系统内部的追踪或重放（Trace/Replay）数据。
+ * 内容为空的 assistant/message：当模型触发 max-tokens 截断时，系统会记录一个空的助手消息节点，
+ * 其唯一职责是承载这步操作的 Token 消耗统计（Usage）。由于它没有实际对话内容，
+ * 如果把它投递给 Provider 会污染上下文，因此必须在这里被拦截返回 null。
  */
 export function deriveEventMessage(event: SessionEvent): Message | null {
   // Intentionally non-exhaustive: only message-producing events derive
